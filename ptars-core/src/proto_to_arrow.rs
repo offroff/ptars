@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::ArrayData;
@@ -159,10 +161,31 @@ fn convert_seconds_nanos_to_unit(seconds: i64, nanos: i32, unit: TimeUnit, type_
 
 static CE_OFFSET: i32 = 719163;
 
-fn enum_name(enum_descriptor: &EnumDescriptor, number: i32) -> String {
-    match enum_descriptor.get_value(number) {
-        Some(v) => v.name().to_string(),
-        None => number.to_string(),
+/// Precomputed number → name table for one enum, built once when the field decoder is
+/// constructed.
+///
+/// Looking the name up through `EnumDescriptor::get_value` and allocating a fresh `String` for
+/// every decoded value was the hot path of string-represented enums on busy topics. The table
+/// returns a borrowed `&str` for declared values; numbers outside the declared set — which
+/// protobuf permits — are formatted on the fly, as before.
+struct EnumNames {
+    by_number: HashMap<i32, String>,
+}
+
+impl EnumNames {
+    fn new(descriptor: &EnumDescriptor) -> Self {
+        let by_number = descriptor
+            .values()
+            .map(|v| (v.number(), v.name().to_string()))
+            .collect();
+        Self { by_number }
+    }
+
+    fn name(&self, number: i32) -> Cow<'_, str> {
+        match self.by_number.get(&number) {
+            Some(name) => Cow::Borrowed(name.as_str()),
+            None => Cow::Owned(number.to_string()),
+        }
     }
 }
 
@@ -359,11 +382,11 @@ enum RepeatedInner {
     },
     EnumString {
         values_builder: StringBuilderInner,
-        enum_descriptor: EnumDescriptor,
+        enum_names: EnumNames,
     },
     EnumBinary {
         values_builder: BinaryBuilderInner,
-        enum_descriptor: EnumDescriptor,
+        enum_names: EnumNames,
     },
     Message {
         sub_decoder: MessageDecoder,
@@ -516,7 +539,7 @@ impl RepeatedInner {
             }
             Self::EnumString {
                 values_builder,
-                enum_descriptor,
+                enum_names,
                 ..
             } => {
                 if wire_type == 2 {
@@ -524,13 +547,13 @@ impl RepeatedInner {
                     let mut p = 0;
                     while p < data.len() {
                         let (v, n) = decode_varint(&data[p..])?;
-                        values_builder.append_value(&enum_name(enum_descriptor, v as i32));
+                        values_builder.append_value(enum_names.name(v as i32).as_ref());
                         p += n;
                     }
                     Ok(total)
                 } else if wire_type == 0 {
                     let (v, n) = decode_varint(buf)?;
-                    values_builder.append_value(&enum_name(enum_descriptor, v as i32));
+                    values_builder.append_value(enum_names.name(v as i32).as_ref());
                     Ok(n)
                 } else {
                     skip_field(wire_type, buf)
@@ -538,7 +561,7 @@ impl RepeatedInner {
             }
             Self::EnumBinary {
                 values_builder,
-                enum_descriptor,
+                enum_names,
                 ..
             } => {
                 if wire_type == 2 {
@@ -546,14 +569,13 @@ impl RepeatedInner {
                     let mut p = 0;
                     while p < data.len() {
                         let (v, n) = decode_varint(&data[p..])?;
-                        values_builder
-                            .append_value(enum_name(enum_descriptor, v as i32).as_bytes());
+                        values_builder.append_value(enum_names.name(v as i32).as_bytes());
                         p += n;
                     }
                     Ok(total)
                 } else if wire_type == 0 {
                     let (v, n) = decode_varint(buf)?;
-                    values_builder.append_value(enum_name(enum_descriptor, v as i32).as_bytes());
+                    values_builder.append_value(enum_names.name(v as i32).as_bytes());
                     Ok(n)
                 } else {
                     skip_field(wire_type, buf)
@@ -904,14 +926,14 @@ enum FieldDecoder {
         has_value: bool,
         has_presence: bool,
         builder: StringBuilderInner,
-        enum_descriptor: EnumDescriptor,
+        enum_names: EnumNames,
     },
     EnumBinary {
         value: i32,
         has_value: bool,
         has_presence: bool,
         builder: BinaryBuilderInner,
-        enum_descriptor: EnumDescriptor,
+        enum_names: EnumNames,
     },
 
     // --- Well-known types (singular, buffered) ---
@@ -1773,14 +1795,14 @@ impl FieldDecoder {
                 has_value,
                 has_presence,
                 builder,
-                enum_descriptor,
+                enum_names,
             } => {
                 if *has_value {
-                    builder.append_value(&enum_name(enum_descriptor, *value));
+                    builder.append_value(enum_names.name(*value).as_ref());
                 } else if *has_presence {
                     builder.append_null();
                 } else {
-                    builder.append_value(&enum_name(enum_descriptor, 0));
+                    builder.append_value(enum_names.name(0).as_ref());
                 }
                 *has_value = false;
                 *value = 0;
@@ -1790,14 +1812,14 @@ impl FieldDecoder {
                 has_value,
                 has_presence,
                 builder,
-                enum_descriptor,
+                enum_names,
             } => {
                 if *has_value {
-                    builder.append_value(enum_name(enum_descriptor, *value).as_bytes());
+                    builder.append_value(enum_names.name(*value).as_bytes());
                 } else if *has_presence {
                     builder.append_null();
                 } else {
-                    builder.append_value(enum_name(enum_descriptor, 0).as_bytes());
+                    builder.append_value(enum_names.name(0).as_bytes());
                 }
                 *has_value = false;
                 *value = 0;
@@ -2584,14 +2606,14 @@ fn build_field_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Option<
                 has_value: false,
                 has_presence,
                 builder: StringBuilderInner::new(config.use_large_string),
-                enum_descriptor: enum_desc,
+                enum_names: EnumNames::new(&enum_desc),
             }),
             EnumRepr::Binary => Some(FieldDecoder::EnumBinary {
                 value: 0,
                 has_value: false,
                 has_presence,
                 builder: BinaryBuilderInner::new(config.use_large_binary),
-                enum_descriptor: enum_desc,
+                enum_names: EnumNames::new(&enum_desc),
             }),
         },
         Kind::Message(msg_desc) => build_message_field_decoder(msg_desc, config),
@@ -2747,11 +2769,11 @@ fn build_repeated_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Opti
             },
             EnumRepr::String => RepeatedInner::EnumString {
                 values_builder: StringBuilderInner::new(config.use_large_string),
-                enum_descriptor: enum_desc,
+                enum_names: EnumNames::new(&enum_desc),
             },
             EnumRepr::Binary => RepeatedInner::EnumBinary {
                 values_builder: BinaryBuilderInner::new(config.use_large_binary),
-                enum_descriptor: enum_desc,
+                enum_names: EnumNames::new(&enum_desc),
             },
         },
         Kind::Message(msg_desc) => {
@@ -2962,14 +2984,14 @@ fn build_singular_decoder_for_map(
                 has_value: false,
                 has_presence: false,
                 builder: StringBuilderInner::new(config.use_large_string),
-                enum_descriptor: enum_desc,
+                enum_names: EnumNames::new(&enum_desc),
             }),
             EnumRepr::Binary => Some(FieldDecoder::EnumBinary {
                 value: 0,
                 has_value: false,
                 has_presence: false,
                 builder: BinaryBuilderInner::new(config.use_large_binary),
-                enum_descriptor: enum_desc,
+                enum_names: EnumNames::new(&enum_desc),
             }),
         },
         Kind::Message(msg_desc) => build_message_field_decoder(msg_desc, config),
@@ -3109,5 +3131,45 @@ mod tests {
         let buf = b"\x00\x01";
         let result = strip_confluent_prefix(buf, ConfluentWirePolicy::Protobuf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_enum_names_borrow_declared_and_format_unknown() {
+        use prost_reflect::prost_types::{
+            EnumDescriptorProto, EnumValueDescriptorProto, FileDescriptorProto,
+        };
+        let file = FileDescriptorProto {
+            name: Some("e.proto".to_string()),
+            package: Some("t".to_string()),
+            enum_type: vec![EnumDescriptorProto {
+                name: Some("Color".to_string()),
+                value: vec![
+                    EnumValueDescriptorProto {
+                        name: Some("UNSPECIFIED".to_string()),
+                        number: Some(0),
+                        ..Default::default()
+                    },
+                    EnumValueDescriptorProto {
+                        name: Some("RED".to_string()),
+                        number: Some(1),
+                        ..Default::default()
+                    },
+                    EnumValueDescriptorProto {
+                        name: Some("NEGATIVE".to_string()),
+                        number: Some(-1),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut pool = prost_reflect::DescriptorPool::new();
+        pool.add_file_descriptor_proto(file).unwrap();
+        let names = EnumNames::new(&pool.get_enum_by_name("t.Color").unwrap());
+        assert!(matches!(names.name(1), Cow::Borrowed("RED")));
+        assert_eq!(names.name(-1), "NEGATIVE");
+        assert_eq!(names.name(0), "UNSPECIFIED");
+        assert!(matches!(names.name(999), Cow::Owned(ref s) if s == "999"));
     }
 }
